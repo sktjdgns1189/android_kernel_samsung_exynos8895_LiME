@@ -22,7 +22,6 @@
 *.lst
 *.symtypes
 *.order
-*.elf
 *.bin
 *.tar
 *.gz
