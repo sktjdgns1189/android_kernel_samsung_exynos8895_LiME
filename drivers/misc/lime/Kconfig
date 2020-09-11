@@ -20,5 +20,12 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 
-lime-y			:= tcp.o disk.o main.o hash.o deflate.o
-obj-$(CONFIG_RAMDUMP_LIME)	+= lime.o
+config RAMDUMP
+	bool "Memory Dump"
+
+config RAMDUMP_LIME
+	tristate "LiME Memory Extractor"
+	default n
+	depends on RAMDUMP
+	---help---
+	  This module allows for volatile memory acquisition from Linux and Linux-based devices.
