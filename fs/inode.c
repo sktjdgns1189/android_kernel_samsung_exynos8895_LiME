@@ -168,9 +168,34 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	mapping->host = inode;
 	mapping->flags = 0;
 	atomic_set(&mapping->i_mmap_writable, 0);
+#ifdef CONFIG_RBIN
+	if ((sb->s_flags & MS_RDONLY) && !shmem_mapping(mapping))
+		mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE |
+					__GFP_RBIN);
+	else
+		mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+#else
 	mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+#endif
 	mapping->private_data = NULL;
 	mapping->writeback_index = 0;
+#if defined(CONFIG_FMP_ECRYPT_FS) || defined(CONFIG_FMP_EXT4CRYPT_FS)
+	mapping->iv = NULL;
+	memset(mapping->key, 0, KEY_MAX_SIZE);
+	mapping->key_length = 0;
+	mapping->alg = NULL;
+	mapping->sensitive_data_index = 0;
+	mapping->hash_tfm = NULL;
+#ifdef CONFIG_CRYPTO_FIPS
+	mapping->cc_enable = 0;
+#endif
+	mapping->private_enc_mode = 0;
+	mapping->private_algo_mode = 0;
+	mapping->plain_text = 0;
+#endif
+#ifdef CONFIG_SDP
+	mapping->userid = 0;
+#endif
 	inode->i_private = NULL;
 	inode->i_mapping = mapping;
 	INIT_HLIST_HEAD(&inode->i_dentry);	/* buggered by rcu freeing */
@@ -1453,7 +1478,11 @@ static void iput_final(struct inode *inode)
 	else
 		drop = generic_drop_inode(inode);
 
+#if defined(CONFIG_FMP_ECRYPT_FS)
+	if (!drop && (sb->s_flags & MS_ACTIVE) && !inode->i_mapping->use_fmp) {
+#else
 	if (!drop && (sb->s_flags & MS_ACTIVE)) {
+#endif
 		inode->i_state |= I_REFERENCED;
 		inode_add_lru(inode);
 		spin_unlock(&inode->i_lock);
@@ -1715,7 +1744,7 @@ int dentry_needs_remove_privs(struct dentry *dentry)
 }
 EXPORT_SYMBOL(dentry_needs_remove_privs);
 
-static int __remove_privs(struct dentry *dentry, int kill)
+static int __remove_privs(struct vfsmount *mnt, struct dentry *dentry, int kill)
 {
 	struct iattr newattrs;
 
@@ -1724,7 +1753,7 @@ static int __remove_privs(struct dentry *dentry, int kill)
 	 * Note we call this on write, so notify_change will not
 	 * encounter any conflicting delegations:
 	 */
-	return notify_change(dentry, &newattrs, NULL);
+	return notify_change2(mnt, dentry, &newattrs, NULL);
 }
 
 /*
@@ -1733,8 +1762,8 @@ static int __remove_privs(struct dentry *dentry, int kill)
  */
 int file_remove_privs(struct file *file)
 {
-	struct dentry *dentry = file->f_path.dentry;
-	struct inode *inode = d_inode(dentry);
+	struct dentry *dentry = file_dentry(file);
+	struct inode *inode = file_inode(file);
 	int kill;
 	int error = 0;
 
@@ -1742,11 +1771,11 @@ int file_remove_privs(struct file *file)
 	if (IS_NOSEC(inode))
 		return 0;
 
-	kill = file_needs_remove_privs(file);
+	kill = dentry_needs_remove_privs(dentry);
 	if (kill < 0)
 		return kill;
 	if (kill)
-		error = __remove_privs(dentry, kill);
+		error = __remove_privs(file->f_path.mnt, dentry, kill);
 	if (!error)
 		inode_has_no_xattr(inode);
 
@@ -1937,8 +1966,14 @@ void inode_init_owner(struct inode *inode, const struct inode *dir,
 	inode->i_uid = current_fsuid();
 	if (dir && dir->i_mode & S_ISGID) {
 		inode->i_gid = dir->i_gid;
+
+		/* Directories are special, and always inherit S_ISGID */
 		if (S_ISDIR(mode))
 			mode |= S_ISGID;
+		else if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
+			!in_group_p(inode->i_gid) &&
+			!capable_wrt_inode_uidgid(dir, CAP_FSETID))
+			mode &= ~S_ISGID;
 	} else
 		inode->i_gid = current_fsgid();
 	inode->i_mode = mode;

@@ -40,6 +40,23 @@ static DEFINE_PER_CPU(struct tick_sched, tick_cpu_sched);
  * The time, when the last jiffy update happened. Protected by jiffies_lock.
  */
 static ktime_t last_jiffies_update;
+struct tick_sched saved_pcpu_ts[NR_CPUS];
+
+void save_pcpu_tick(int cpu)
+{
+	saved_pcpu_ts[cpu] = per_cpu(tick_cpu_sched, cpu);
+	kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE] = usecs_to_cputime64(ktime_to_us(saved_pcpu_ts[cpu].idle_sleeptime));
+	kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT] = usecs_to_cputime64(ktime_to_us(saved_pcpu_ts[cpu].iowait_sleeptime));
+}
+EXPORT_SYMBOL(save_pcpu_tick);
+
+void restore_pcpu_tick(int cpu)
+{
+	struct tick_sched *ts = &per_cpu(tick_cpu_sched, cpu);
+	ts->idle_sleeptime = saved_pcpu_ts[cpu].idle_sleeptime;
+	ts->iowait_sleeptime = saved_pcpu_ts[cpu].iowait_sleeptime;
+}
+EXPORT_SYMBOL(restore_pcpu_tick);
 
 struct tick_sched *tick_get_tick_sched(int cpu)
 {
@@ -568,6 +585,11 @@ static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
 		tick_program_event(hrtimer_get_expires(&ts->sched_timer), 1);
 }
 
+static inline bool local_timer_softirq_pending(void)
+{
+	return local_softirq_pending() & TIMER_SOFTIRQ;
+}
+
 static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
 					 ktime_t now, int cpu)
 {
@@ -584,8 +606,18 @@ static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
 	} while (read_seqretry(&jiffies_lock, seq));
 	ts->last_jiffies = basejiff;
 
-	if (rcu_needs_cpu(basemono, &next_rcu) ||
-	    arch_needs_cpu() || irq_work_needs_cpu()) {
+	/*
+	 * Keep the periodic tick, when RCU, architecture or irq_work
+	 * requests it.
+	 * Aside of that check whether the local timer softirq is
+	 * pending. If so its a bad idea to call get_next_timer_interrupt()
+	 * because there is an already expired timer, so it will request
+	 * immeditate expiry, which rearms the hardware timer with a
+	 * minimal delta which brings us back to this place
+	 * immediately. Lather, rinse and repeat...
+	 */
+	if (rcu_needs_cpu(basemono, &next_rcu) || arch_needs_cpu() ||
+	    irq_work_needs_cpu() || local_timer_softirq_pending()) {
 		next_tick = basemono + TICK_NSEC;
 	} else {
 		/*
@@ -868,6 +900,18 @@ ktime_t tick_nohz_get_sleep_length(void)
 	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
 
 	return ts->sleep_length;
+}
+
+/**
+ * tick_nohz_get_idle_calls - return the current idle calls counter value
+ *
+ * Called from the schedutil frequency scaling governor in scheduler context.
+ */
+unsigned long tick_nohz_get_idle_calls(void)
+{
+	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
+
+	return ts->idle_calls;
 }
 
 static void tick_nohz_account_idle_ticks(struct tick_sched *ts)

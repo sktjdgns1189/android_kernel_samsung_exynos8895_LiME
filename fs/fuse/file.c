@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_passthrough.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -16,13 +17,16 @@
 #include <linux/compat.h>
 #include <linux/swap.h>
 #include <linux/falloc.h>
+#include <linux/statfs.h>
 #include <linux/uio.h>
 
 static const struct file_operations fuse_direct_io_file_operations;
 
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
-			  int opcode, struct fuse_open_out *outargp)
+			  int opcode, struct fuse_open_out *outargp,
+			  struct file **passthrough_filpp)
 {
+	int ret_val;
 	struct fuse_open_in inarg;
 	FUSE_ARGS(args);
 
@@ -38,18 +42,28 @@ static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	args.out.numargs = 1;
 	args.out.args[0].size = sizeof(*outargp);
 	args.out.args[0].value = outargp;
+	args.out.passthrough_filp = NULL;
 
-	return fuse_simple_request(fc, &args);
+	ret_val = fuse_simple_request(fc, &args);
+
+	if (args.out.passthrough_filp != NULL)
+		*passthrough_filpp = args.out.passthrough_filp;
+
+	return ret_val;
 }
 
 struct fuse_file *fuse_file_alloc(struct fuse_conn *fc)
 {
 	struct fuse_file *ff;
 
-	ff = kmalloc(sizeof(struct fuse_file), GFP_KERNEL);
+	ff = kzalloc(sizeof(struct fuse_file), GFP_KERNEL);
 	if (unlikely(!ff))
 		return NULL;
 
+	ff->passthrough_filp = NULL;
+	ff->passthrough_enabled = 0;
+	if (fc->passthrough)
+		ff->passthrough_enabled = 1;
 	ff->fc = fc;
 	ff->reserved_req = fuse_request_alloc(0);
 	if (unlikely(!ff->reserved_req)) {
@@ -100,6 +114,7 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
 			iput(req->misc.release.inode);
 			fuse_put_request(ff->fc, req);
 		} else if (sync) {
+			__set_bit(FR_FORCE, &req->flags);
 			__clear_bit(FR_BACKGROUND, &req->flags);
 			fuse_request_send(ff->fc, req);
 			iput(req->misc.release.inode);
@@ -117,6 +132,7 @@ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 		 bool isdir)
 {
 	struct fuse_file *ff;
+	struct file *passthrough_filp = NULL;
 	int opcode = isdir ? FUSE_OPENDIR : FUSE_OPEN;
 
 	ff = fuse_file_alloc(fc);
@@ -129,10 +145,12 @@ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 		struct fuse_open_out outarg;
 		int err;
 
-		err = fuse_send_open(fc, nodeid, file, opcode, &outarg);
+		err = fuse_send_open(fc, nodeid, file, opcode, &outarg,
+				     &(passthrough_filp));
 		if (!err) {
 			ff->fh = outarg.fh;
 			ff->open_flags = outarg.open_flags;
+			ff->passthrough_filp = passthrough_filp;
 
 		} else if (err != -ENOSYS || isdir) {
 			fuse_file_free(ff);
@@ -251,6 +269,8 @@ void fuse_release_common(struct file *file, int opcode)
 	ff = file->private_data;
 	if (unlikely(!ff))
 		return;
+
+	fuse_passthrough_release(ff);
 
 	req = ff->reserved_req;
 	fuse_prepare_release(ff, file->f_flags, opcode);
@@ -417,6 +437,15 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	fuse_sync_writes(inode);
 	mutex_unlock(&inode->i_mutex);
 
+	if (test_bit(AS_ENOSPC, &file->f_mapping->flags) &&
+	    test_and_clear_bit(AS_ENOSPC, &file->f_mapping->flags))
+		err = -ENOSPC;
+	if (test_bit(AS_EIO, &file->f_mapping->flags) &&
+	    test_and_clear_bit(AS_EIO, &file->f_mapping->flags))
+		err = -EIO;
+	if (err)
+		return err;
+
 	req = fuse_get_req_nofail_nopages(fc, file);
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
@@ -462,6 +491,21 @@ int fuse_fsync_common(struct file *file, loff_t start, loff_t end,
 		goto out;
 
 	fuse_sync_writes(inode);
+
+	/*
+	 * Due to implementation of fuse writeback
+	 * filemap_write_and_wait_range() does not catch errors.
+	 * We have to do this directly after fuse_sync_writes()
+	 */
+	if (test_bit(AS_ENOSPC, &file->f_mapping->flags) &&
+	    test_and_clear_bit(AS_ENOSPC, &file->f_mapping->flags))
+		err = -ENOSPC;
+	if (test_bit(AS_EIO, &file->f_mapping->flags) &&
+	    test_and_clear_bit(AS_EIO, &file->f_mapping->flags))
+		err = -EIO;
+	if (err)
+		goto out;
+
 	err = sync_inode_metadata(inode, 1);
 	if (err)
 		goto out;
@@ -516,13 +560,13 @@ void fuse_read_fill(struct fuse_req *req, struct file *file, loff_t pos,
 	req->out.args[0].size = count;
 }
 
-static void fuse_release_user_pages(struct fuse_req *req, int write)
+static void fuse_release_user_pages(struct fuse_req *req, bool should_dirty)
 {
 	unsigned i;
 
 	for (i = 0; i < req->num_pages; i++) {
 		struct page *page = req->pages[i];
-		if (write)
+		if (should_dirty)
 			set_page_dirty_lock(page);
 		put_page(page);
 	}
@@ -903,8 +947,10 @@ out:
 
 static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	ssize_t ret_val;
 	struct inode *inode = iocb->ki_filp->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_file *ff = iocb->ki_filp->private_data;
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -919,7 +965,12 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return err;
 	}
 
-	return generic_file_read_iter(iocb, to);
+	if (ff && ff->passthrough_enabled && ff->passthrough_filp)
+		ret_val = fuse_passthrough_read_iter(iocb, to);
+	else
+		ret_val = generic_file_read_iter(iocb, to);
+
+	return ret_val;
 }
 
 static void fuse_write_fill(struct fuse_req *req, struct fuse_file *ff,
@@ -1148,9 +1199,73 @@ static ssize_t fuse_perform_write(struct file *file,
 	return res > 0 ? res : err;
 }
 
+/*
+ * Return 0, if a disk has enough free space.
+ * Return error, if vfs_statfs is failed, otherwise -ENOSPC.
+ * We assume that any files can not be overwritten.
+ */
+static inline int check_min_free_space(struct path *lower_path, size_t size,
+					unsigned int reserved_mb)
+{
+	int err;
+	struct kstatfs statfs;
+	u64 avail;
+
+	BUG_ON(!lower_path);
+
+	if (!reserved_mb)
+		return 0;
+
+	/* Get fs stat of lower filesystem. */
+	err = vfs_statfs(lower_path, &statfs);
+	if (unlikely(err)) {
+		printk(KERN_ERR "vfs_statfs error : %d\n", err);
+		return err;
+	}
+
+	/* Invalid statfs informations. */
+	if (unlikely(statfs.f_bsize == 0))
+		goto out_invalid;
+
+	/* available size */
+	avail = statfs.f_bavail * statfs.f_bsize;
+
+	/* not enough space */
+	if ((u64)size > avail)
+		goto out_nospc;
+
+	/* not enough space */
+	if ((avail - size) < ((u64)reserved_mb << 20))
+		goto out_nospc;
+
+	return 0;
+
+out_invalid:
+	printk(KERN_INFO "statfs               : invalid return\n");
+	printk(KERN_INFO "statfs.f_type        : 0x%X\n", (u32)statfs.f_type);
+	printk(KERN_INFO "statfs.f_blocks      : %llu blocks\n", statfs.f_blocks);
+	printk(KERN_INFO "statfs.f_bfree       : %llu blocks\n", statfs.f_bfree);
+	printk(KERN_INFO "statfs.f_files       : %llu\n", statfs.f_files);
+	printk(KERN_INFO "statfs.f_ffree       : %llu\n", statfs.f_ffree);
+	printk(KERN_INFO "statfs.f_fsid.val[1] : 0x%X\n", (u32)statfs.f_fsid.val[1]);
+	printk(KERN_INFO "statfs.f_fsid.val[0] : 0x%X\n", (u32)statfs.f_fsid.val[0]);
+	printk(KERN_INFO "statfs.f_namelen     : %ld\n", statfs.f_namelen);
+	printk(KERN_INFO "statfs.f_frsize      : %ld\n", statfs.f_frsize);
+	printk(KERN_INFO "statfs.f_flags       : %ld\n", statfs.f_flags);
+	printk(KERN_INFO "fuse reserved_mb : %u\n", reserved_mb);
+
+out_nospc:
+	printk_ratelimited(KERN_INFO "statfs.f_bavail : %llu blocks / "
+				     "statfs.f_bsize : %ld bytes / "
+				     "required size : %llu byte\n"
+				,statfs.f_bavail, statfs.f_bsize, (u64)size);
+	return -ENOSPC;
+}
+
 static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
 	struct address_space *mapping = file->f_mapping;
 	ssize_t written = 0;
 	ssize_t written_buffered = 0;
@@ -1183,6 +1298,16 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	err = file_update_time(file);
 	if (err)
 		goto out;
+
+	if (ff && ff->passthrough_enabled && ff->passthrough_filp) {
+		err = check_min_free_space(&ff->passthrough_filp->f_path,
+				iov_iter_count(from), ff->fc->reserved_space_mb);
+		if (err)
+			goto out;
+
+		written = fuse_passthrough_write_iter(iocb, from);
+		goto out;
+	}
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		loff_t pos = iocb->ki_pos;
@@ -1307,6 +1432,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		       loff_t *ppos, int flags)
 {
 	int write = flags & FUSE_DIO_WRITE;
+	bool should_dirty = !write && iter_is_iovec(iter);
 	int cuse = flags & FUSE_DIO_CUSE;
 	struct file *file = io->file;
 	struct inode *inode = file->f_mapping->host;
@@ -1351,7 +1477,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			nres = fuse_send_read(req, io, pos, nbytes, owner);
 
 		if (!io->async)
-			fuse_release_user_pages(req, !write);
+			fuse_release_user_pages(req, should_dirty);
 		if (req->out.h.error) {
 			if (!res)
 				res = req->out.h.error;
@@ -1972,6 +2098,10 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 {
 	struct inode *inode = page->mapping->host;
 
+	/* Haven't copied anything?  Skip zeroing, size extending, dirtying. */
+	if (!copied)
+		goto unlock;
+
 	if (!PageUptodate(page)) {
 		/* Zero any unwritten bytes at the end of the page */
 		size_t endoff = (pos + copied) & ~PAGE_CACHE_MASK;
@@ -1982,6 +2112,8 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 
 	fuse_write_update_size(inode, pos + copied);
 	set_page_dirty(page);
+
+unlock:
 	unlock_page(page);
 	page_cache_release(page);
 
@@ -2049,6 +2181,9 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	struct fuse_file *ff = file->private_data;
+
+	ff->passthrough_enabled = 0;
 	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
 		fuse_link_write_file(file);
 
@@ -2059,6 +2194,9 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int fuse_direct_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	struct fuse_file *ff = file->private_data;
+
+	ff->passthrough_enabled = 0;
 	/* Can't provide the coherency needed for MAP_SHARED */
 	if (vma->vm_flags & VM_MAYSHARE)
 		return -ENODEV;

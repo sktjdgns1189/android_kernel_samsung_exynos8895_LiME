@@ -520,9 +520,23 @@ static ssize_t sockfs_listxattr(struct dentry *dentry, char *buffer,
 	return used;
 }
 
+static int sockfs_setattr(struct dentry *dentry, struct iattr *iattr)
+{
+	int err = simple_setattr(dentry, iattr);
+
+	if (!err && (iattr->ia_valid & ATTR_UID)) {
+		struct socket *sock = SOCKET_I(d_inode(dentry));
+
+		sock->sk->sk_uid = iattr->ia_uid;
+	}
+
+	return err;
+}
+
 static const struct inode_operations sockfs_inode_ops = {
 	.getxattr = sockfs_getxattr,
 	.listxattr = sockfs_listxattr,
+	.setattr = sockfs_setattr,
 };
 
 /**
@@ -537,12 +551,23 @@ static struct socket *sock_alloc(void)
 {
 	struct inode *inode;
 	struct socket *sock;
-
+    /* START_OF_KNOX_VPN */
+    struct timespec open_timespec;
+    /* END_OF_KNOX_VPN */
 	inode = new_inode_pseudo(sock_mnt->mnt_sb);
 	if (!inode)
 		return NULL;
 
 	sock = SOCKET_I(inode);
+
+    /* START_OF_KNOX_VPN */
+    if(sock) {
+        sock->knox_sent = 0;
+        sock->knox_recv = 0;
+        open_timespec = current_kernel_time();
+        sock->open_time = open_timespec.tv_sec;
+    }
+    /* END_OF_KNOX_VPN */
 
 	kmemcheck_annotate_bitfield(sock, type);
 	inode->i_ino = get_next_ino();
@@ -582,6 +607,11 @@ void sock_release(struct socket *sock)
 		iput(SOCK_INODE(sock));
 		return;
 	}
+    /* START_OF_KNOX_VPN */
+    sock->knox_sent = 0;
+    sock->knox_recv = 0;
+    sock->open_time = 0;
+    /* END_OF_KNOX_VPN */
 	sock->file = NULL;
 }
 EXPORT_SYMBOL(sock_release);
@@ -1697,6 +1727,7 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 	/* We assume all kernel code knows the size of sockaddr_storage */
 	msg.msg_namelen = 0;
 	msg.msg_iocb = NULL;
+	msg.msg_flags = 0;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	err = sock_recvmsg(sock, &msg, iov_iter_count(&msg.msg_iter), flags);
@@ -2041,6 +2072,8 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 		if (err)
 			break;
 		++datagrams;
+		if (msg_data_left(&msg_sys))
+			break;
 	}
 
 	fput_light(sock->file, fput_needed);
@@ -2183,8 +2216,10 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 		return err;
 
 	err = sock_error(sock->sk);
-	if (err)
+	if (err) {
+		datagrams = err;
 		goto out_put;
+	}
 
 	entry = mmsg;
 	compat_entry = (struct compat_mmsghdr __user *)mmsg;

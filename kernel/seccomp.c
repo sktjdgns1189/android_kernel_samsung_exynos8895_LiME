@@ -33,6 +33,10 @@
 #include <linux/tracehook.h>
 #include <linux/uaccess.h>
 
+#ifdef CONFIG_LOD_SEC
+#include <linux/linux_on_dex.h>
+#endif
+
 /**
  * struct seccomp_filter - container for seccomp BPF programs
  *
@@ -457,14 +461,19 @@ static long seccomp_attach_filter(unsigned int flags,
 	return 0;
 }
 
+void __get_seccomp_filter(struct seccomp_filter *filter)
+{
+	/* Reference count is bounded by the number of total processes. */
+	atomic_inc(&filter->usage);
+}
+
 /* get_seccomp_filter - increments the reference count of the filter on @tsk */
 void get_seccomp_filter(struct task_struct *tsk)
 {
 	struct seccomp_filter *orig = tsk->seccomp.filter;
 	if (!orig)
 		return;
-	/* Reference count is bounded by the number of total processes. */
-	atomic_inc(&orig->usage);
+	__get_seccomp_filter(orig);
 }
 
 static inline void seccomp_filter_free(struct seccomp_filter *filter)
@@ -475,16 +484,20 @@ static inline void seccomp_filter_free(struct seccomp_filter *filter)
 	}
 }
 
-/* put_seccomp_filter - decrements the ref count of tsk->seccomp.filter */
-void put_seccomp_filter(struct task_struct *tsk)
+static void __put_seccomp_filter(struct seccomp_filter *orig)
 {
-	struct seccomp_filter *orig = tsk->seccomp.filter;
 	/* Clean up single-reference branches iteratively. */
 	while (orig && atomic_dec_and_test(&orig->usage)) {
 		struct seccomp_filter *freeme = orig;
 		orig = orig->prev;
 		seccomp_filter_free(freeme);
 	}
+}
+
+/* put_seccomp_filter - decrements the ref count of tsk->seccomp.filter */
+void put_seccomp_filter(struct task_struct *tsk)
+{
+	__put_seccomp_filter(tsk->seccomp.filter);
 }
 
 /**
@@ -613,6 +626,13 @@ static u32 __seccomp_phase1_filter(int this_syscall, struct seccomp_data *sd)
 
 	case SECCOMP_RET_KILL:
 	default:
+#if (defined CONFIG_LOD_SEC) && (!defined CONFIG_SAMSUNG_PRODUCT_SHIP)
+		if (current_is_LOD())
+			printk(KERN_WARNING "LOD SECCOMP blocked syscall No. %d PROC %s PID %d "
+				"UID %d\n", this_syscall, current->comm, current->pid, 
+				current_cred()->uid.val);
+#endif
+
 		audit_seccomp(this_syscall, SIGSYS, action);
 		do_exit(SIGSYS);
 	}
@@ -927,13 +947,13 @@ long seccomp_get_filter(struct task_struct *task, unsigned long filter_off,
 	if (!data)
 		goto out;
 
-	get_seccomp_filter(task);
+	__get_seccomp_filter(filter);
 	spin_unlock_irq(&task->sighand->siglock);
 
 	if (copy_to_user(data, fprog->filter, bpf_classic_proglen(fprog)))
 		ret = -EFAULT;
 
-	put_seccomp_filter(task);
+	__put_seccomp_filter(filter);
 	return ret;
 
 out:

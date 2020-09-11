@@ -910,9 +910,12 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	}
 
 	/*
-	 * If we finished all bytes in the request we are done now.
+	 * special case: failed zero length commands always need to
+	 * drop down into the retry code. Otherwise, if we finished
+	 * all bytes in the request we are done now.
 	 */
-	if (!scsi_end_request(req, error, good_bytes, 0))
+	if (!(blk_rq_bytes(req) == 0 && error) &&
+	    !scsi_end_request(req, error, good_bytes, 0))
 		return;
 
 	/*
@@ -1117,7 +1120,8 @@ int scsi_init_io(struct scsi_cmnd *cmd)
 	bool is_mq = (rq->mq_ctx != NULL);
 	int error;
 
-	BUG_ON(!rq->nr_phys_segments);
+	if (WARN_ON_ONCE(!rq->nr_phys_segments))
+		return -EINVAL;
 
 	error = scsi_init_sgtable(rq, &cmd->sdb);
 	if (error)
@@ -1612,7 +1616,7 @@ static void scsi_kill_request(struct request *req, struct request_queue *q)
 	blk_complete_request(req);
 }
 
-static void scsi_softirq_done(struct request *rq)
+void scsi_softirq_done(struct request *rq)
 {
 	struct scsi_cmnd *cmd = rq->special;
 	unsigned long wait_for = (cmd->allowed + 1) * rq->timeout;
@@ -1801,6 +1805,7 @@ static void scsi_request_fn(struct request_queue *q)
 		if (!(blk_queue_tagged(q) && !blk_queue_start_tag(q, req)))
 			blk_start_request(req);
 
+		preempt_disable();
 		spin_unlock_irq(q->queue_lock);
 		cmd = req->special;
 		if (unlikely(cmd == NULL)) {
@@ -1825,15 +1830,20 @@ static void scsi_request_fn(struct request_queue *q)
 			if (list_empty(&sdev->starved_entry))
 				list_add_tail(&sdev->starved_entry,
 					      &shost->starved_list);
+			preempt_enable_no_resched();
 			spin_unlock_irq(shost->host_lock);
 			goto not_ready;
 		}
 
-		if (!scsi_target_queue_ready(shost, sdev))
+		if (!scsi_target_queue_ready(shost, sdev)) {
+			preempt_enable_no_resched();
 			goto not_ready;
+		}
 
-		if (!scsi_host_queue_ready(q, shost, sdev))
+		if (!scsi_host_queue_ready(q, shost, sdev)) {
+			preempt_enable_no_resched();
 			goto host_not_ready;
+		}
 	
 		if (sdev->simple_tags)
 			cmd->flags |= SCMD_TAGGED;
@@ -1851,6 +1861,7 @@ static void scsi_request_fn(struct request_queue *q)
 		 */
 		cmd->scsi_done = scsi_done;
 		rtn = scsi_dispatch_cmd(cmd);
+		preempt_enable_no_resched();
 		if (rtn) {
 			scsi_queue_insert(cmd, rtn);
 			spin_lock_irq(q->queue_lock);
@@ -2210,6 +2221,29 @@ void scsi_mq_destroy_tags(struct Scsi_Host *shost)
 {
 	blk_mq_free_tag_set(&shost->tag_set);
 }
+
+/**
+ * scsi_device_from_queue - return sdev associated with a request_queue
+ * @q: The request queue to return the sdev from
+ *
+ * Return the sdev associated with a request queue or NULL if the
+ * request_queue does not reference a SCSI device.
+ */
+struct scsi_device *scsi_device_from_queue(struct request_queue *q)
+{
+	struct scsi_device *sdev = NULL;
+
+	if (q->mq_ops) {
+		if (q->mq_ops == &scsi_mq_ops)
+			sdev = q->queuedata;
+	} else if (q->request_fn == scsi_request_fn)
+		sdev = q->queuedata;
+	if (!sdev || !get_device(&sdev->sdev_gendev))
+		sdev = NULL;
+
+	return sdev;
+}
+EXPORT_SYMBOL_GPL(scsi_device_from_queue);
 
 /*
  * Function:    scsi_block_requests()
